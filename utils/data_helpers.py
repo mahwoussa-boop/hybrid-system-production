@@ -286,7 +286,13 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
         if salla_input.empty:
             return pd.DataFrame()
     else:
-        salla_input = missing_df  # الملف القديم بدون العمود → يُصدَّر كله
+        # S4 Fix: لا عمود حالة → استثنِ أي صف يحمل علامة «⚠️» في أي عمود نصي
+        _dup_mask = pd.Series(False, index=missing_df.index)
+        for _col in missing_df.select_dtypes(include="object").columns:
+            _dup_mask |= missing_df[_col].astype(str).str.startswith("⚠️", na=False)
+        salla_input = missing_df[~_dup_mask].copy()
+        if salla_input.empty:
+            salla_input = missing_df.copy()  # إذا كل الصفوف محتملة → أرسل الكل
 
     salla_input = salla_input.reset_index(drop=True)
     n = len(salla_input)
@@ -297,10 +303,11 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
             return salla_input[col_name].fillna("").astype(str)
         return pd.Series([""] * n, index=salla_input.index)
 
-    # 1) بيانات أساسية إجبارية (بعناوين سلة الحرفية)
-    salla_df["النوع"] = ["منتج"] * n
+    # Bug 2 Fix: اسم العمود «النوع » مع مسافة (حرفي من قالب سلة 2024)
+    salla_df["النوع "] = ["منتج"] * n
     salla_df["أسم المنتج"] = _series_or_blank("منتج_المنافس")
-    # تصنيف: يُفضَّل العمود المُطابَق "تصنيف_سلة_الدقيق" ثم فارغ (لا افتراضي أعمى)
+
+    # Bug 6 Fix: تصنيف ذكي بـ fuzzy عند غياب العمود الجاهز
     if "تصنيف_سلة_الدقيق" in salla_input.columns:
         salla_df["تصنيف المنتج"] = _series_or_blank("تصنيف_سلة_الدقيق")
     elif "القسم" in salla_input.columns:
@@ -308,18 +315,45 @@ def format_missing_for_salla(missing_df: pd.DataFrame) -> pd.DataFrame:
     elif "التصنيف" in salla_input.columns:
         salla_df["تصنيف المنتج"] = _series_or_blank("التصنيف")
     else:
-        salla_df["تصنيف المنتج"] = ""
+        try:
+            from utils.salla_shamel_export import _best_category_from_rules as _bcr
+            _gnd = _series_or_blank("الجنس")
+            _typ = _series_or_blank("النوع")
+            salla_df["تصنيف المنتج"] = [
+                _bcr(nm, gn, tp)
+                for nm, gn, tp in zip(
+                    salla_df["أسم المنتج"], _gnd, _typ
+                )
+            ]
+        except Exception:
+            salla_df["تصنيف المنتج"] = "العطور"
+
     salla_df["صورة المنتج"] = _series_or_blank("صورة_المنافس")
     salla_df["وصف صورة المنتج"] = ""
     salla_df["نوع المنتج"] = ["منتج جاهز"] * n
     # سعر المنتج: رقم صريح — سلة ترفض النص ذا الفواصل أو رموز العملة
     from utils.helpers import safe_float as _sf
     salla_df["سعر المنتج"] = _series_or_blank("سعر_المنافس").map(_sf)
-    salla_df["الكمية المتوفرة"] = [0] * n
-    # الوصف: يُفضَّل الوصف الآلي (HTML من AI)؛ يُعاد لفارغ إذا لم يُولَّد بعد
-    salla_df["الوصف"] = _series_or_blank("الوصف_الآلي")
+    # Bug 2 Fix: «الكمية المتوفرة» محذوف من قالب سلة 2024 — لا تُضَف
+    # الوصف: يُفضَّل الوصف الآلي (HTML من AI)؛ يُعاد لـ placeholder إذا لم يُولَّد بعد
+    salla_df["الوصف"] = _series_or_blank("الوصف_الآلي").replace("", "عطر أصلي من متجر مهووس")
+
     salla_df["هل يتطلب شحن؟"] = ["نعم"] * n
-    salla_df["رمز المنتج sku"] = _series_or_blank("معرف_المنافس")
+
+    # Bug 5 Fix: SKU من 6 حقول بديلة + اشتقاق من رابط المنتج
+    def _pick_sku(row_dict):
+        for col in ("معرف_المنافس", "رمز المنتج sku", "رمز_المنتج_sku", "SKU", "sku", "رمز المنتج"):
+            v = str(row_dict.get(col, "") or "").strip()
+            if v and v.lower() not in ("nan", "none", "<na>"):
+                return v[:100]
+        for url_col in ("رابط_المنافس", "رابط المنتج", "product_url", "url"):
+            u = str(row_dict.get(url_col, "") or "").strip()
+            if u.startswith("http"):
+                parts = [p for p in u.rstrip("/").split("/") if p]
+                return parts[-1][:50] if parts else ""
+        return ""
+
+    salla_df["رمز المنتج sku"] = salla_input.apply(lambda r: _pick_sku(r.to_dict()), axis=1)
 
     # 2) أعمدة مالية/إدارية
     salla_df["سعر التكلفة"] = ""

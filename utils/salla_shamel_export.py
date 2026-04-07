@@ -23,6 +23,9 @@ _logger = logging.getLogger(__name__)
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
+# هامش الربح الافتراضي فوق سعر المنافس (قابل للتغيير بـ env var)
+_PRICE_MARKUP_FACTOR = float(os.environ.get("SALLA_PRICE_MARKUP", "1.05"))
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  قالب سلة 2024 — الأعمدة بالترتيب والمسمى الحرفي
 #  تنبيه: "النوع " (مسافة في النهاية) و"أسم المنتج" (همزة قطع) — لا تغيّرهما
@@ -289,29 +292,36 @@ def _is_url(s: str) -> bool:
 def _single_image_url(raw: str) -> str:
     """
     يُرجع رابط صورة واحد نظيف — لا فراغات، لا روابط متعددة.
-    يقطع عند أول رابط ثانٍ حتى لو كان CDN.
+    يدعم روابط CDN سلة التي تحتوي فواصل في معاملات التحويل
+    مثل: cdn.salla.sa/cdn-cgi/image/width=800,fit=contain/...
     """
     s = str(raw or "").strip()
     if not s:
         return ""
-    # إزالة أي بيانات base64
     if s.startswith("data:"):
         return ""
     # قطع عند بداية أي رابط ثانٍ (https:// أو http:// بعد الحرف 8)
     idx_http  = s.find("http://", 8)
     idx_https = s.find("https://", 8)
-    candidates = [i for i in (idx_http, idx_https) if i > 0]
-    if candidates:
-        cut = min(candidates)
-        s = s[:cut].rstrip(",،. \t\n\r")
-    # استخراج أول URL نظيف (بدون مسافة أو اقتباسات)
+    cuts = [i for i in (idx_http, idx_https) if i > 0]
+    if cuts:
+        s = s[:min(cuts)].rstrip(" \t\n\r")
+    # محاولة 1: رابط ينتهي بامتداد صريح (يشمل CDN الذي ينتهي بامتداد)
     m = re.search(
-        r"(https?://[^\s<>\"',\u060c؛;]+?\.(?:webp|jpg|jpeg|png|gif|avif)(?:[?#][^\s<>\"',]*)?)",
+        r"(https?://[^\s<>\"'؛;]+?\.(?:webp|jpg|jpeg|png|gif|avif)(?:[?#][^\s<>\"']*)?)",
         s, re.I,
     )
     if m:
         return m.group(1).rstrip(".,;)>]")
-    m2 = re.search(r"(https?://[^\s\"'<>,،]+)", s)
+    # محاولة 2: رابط CDN سلة — يحتوي /cdn-cgi/ أو /image/ مع فواصل في المعاملات
+    m_cdn = re.search(
+        r"(https?://[^\s\"'<>]+/(?:cdn-cgi|image)/[^\s\"'<>]*)",
+        s, re.I,
+    )
+    if m_cdn:
+        return m_cdn.group(1).rstrip(".,;)>]")
+    # محاولة 3: أي رابط HTTP — الفاصلة مسموحة (CDN) لكن المسافات والاقتباسات لا
+    m2 = re.search(r"(https?://[^\s\"'<>\u060c]+)", s)
     return m2.group(1).rstrip(".,;)>]") if m2 else ""
 
 
@@ -452,6 +462,14 @@ def export_to_salla_shamel(
     if missing_df is None or missing_df.empty:
         return ("\ufeff" + buf.getvalue()).encode("utf-8")
 
+    # F2 Fix: فلترة المنتجات المؤكدة فقط — تستثني «⚠️ مكرر محتمل»
+    if "حالة_المنتج" in missing_df.columns:
+        _confirmed = missing_df[
+            missing_df["حالة_المنتج"].str.startswith("✅", na=False)
+        ]
+        if not _confirmed.empty:
+            missing_df = _confirmed
+
     for idx, row in missing_df.iterrows():
         r = row.to_dict()
 
@@ -460,9 +478,9 @@ def export_to_salla_shamel(
         if not pname:
             pname = _strip_html_visible(str(r.get("منتج_المنافس", "") or "")) or "منتج"
 
-        # ── السعر ─────────────────────────────────────────────────────────
+        # ── السعر — سعرنا المقترح = سعر المنافس + هامش ربح افتراضي 5% ──────
         comp_price = _extract_price(r)
-        list_price = comp_price if comp_price > 0 else 1.0
+        list_price = round(comp_price * _PRICE_MARKUP_FACTOR, 2) if comp_price > 0 else 1.0
 
         # ── البيانات الوصفية ───────────────────────────────────────────────
         brand  = str(r.get("الماركة",  "") or "").strip()
@@ -504,17 +522,20 @@ def export_to_salla_shamel(
             else:
                 brand_out = ""
 
-        # ── الوصف — HTML نقي (لا Markdown) ──────────────────────────────
-        if generate_descriptions:
+        # ── الوصف — أولوية: الوصف_الآلي المولد مسبقاً ثم generate_descriptions ثم placeholder ──
+        _ai_desc = _strip_html_visible(str(r.get("الوصف_الآلي", "") or "")).strip()
+        if _ai_desc and _ai_desc.lower() not in ("nan", "none"):
+            desc_text = _ai_desc
+        elif generate_descriptions:
             try:
                 from engines.ai_engine import generate_salla_html_description
                 raw_scraped = str(r.get("raw_description", "") or "").strip()
                 desc_text = generate_salla_html_description(pname, raw_scraped)
             except Exception as _e:
                 _logger.warning("generate_salla_html_description فشل للمنتج '%s': %s", pname, _e)
-                desc_text = _placeholder_description(pname, brand_out)
+                desc_text = "عطر أصلي من متجر مهووس"
         else:
-            desc_text = _placeholder_description(pname, brand_out)
+            desc_text = "عطر أصلي من متجر مهووس"
 
         # وصف الصورة — نص خالٍ من الأحرف الخاصة (قيد سلة)
         alt_txt = _safe_alt_text(f"زجاجة عطر {pname} الأصلية")
@@ -613,12 +634,18 @@ def get_new_brands_summary() -> dict:
 
 def invalidate_brand_cache() -> None:
     """
-    يُفرغ ذاكرة التخزين المؤقت للماركات — يُستدعى بعد رفع ملف brands.csv جديد.
-    يُصفّر كلاً من LRU cache الموجود ومفتاح BrandManager.
+    يُفرغ ذاكرة التخزين المؤقت للماركات والأقسام — يُستدعى بعد رفع ملف brands.csv جديد.
+    يُصفّر كلاً من LRU cache الموجود ومفتاح BrandManager وـ ai_engine.
     """
     _load_valid_brands.cache_clear()
+    _load_valid_categories.cache_clear()
     try:
         from utils.brand_manager import reload_brands_file
         reload_brands_file()
+    except Exception:
+        pass
+    try:
+        from engines.ai_engine import clear_catalog_cache
+        clear_catalog_cache()
     except Exception:
         pass
