@@ -204,7 +204,9 @@ def evaluate_and_store_pricing(
         return result
 
     # ── بناء idempotency_key منع التكرار ─────────────────────────────────
-    idem_raw  = f"pricing:{our_product_id}:{recommendation}:{datetime.now().strftime('%Y-%m-%d')}"
+    # يتضمن سعرنا المقرَّب لتمييز قرارات نفس التوصية بأسعار مختلفة في اليوم ذاته
+    _price_bucket = round(float(our_price or 0))
+    idem_raw  = f"pricing:{our_product_id}:{recommendation}:{_price_bucket}:{datetime.now().strftime('%Y-%m-%d')}"
     idem_key  = hashlib.sha256(idem_raw.encode()).hexdigest()[:40]
 
     # ── بناء payload للـ Outbox ───────────────────────────────────────────

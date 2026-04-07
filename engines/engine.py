@@ -1857,21 +1857,54 @@ def _ai_batch(batch):
     if not batch:
         return [], []
 
-    # ── cache (يحفظ الـ tuple كاملاً) ───────────────────────────────────
-    ck = hashlib.md5(json.dumps(
-        [{"o": x["our"], "c": [c["name"] for c in x["candidates"]]} for x in batch],
-        ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-    cached = _cget(ck)
-    if cached is not None:
-        # دعم الـ cache القديم (قائمة أرقام) والجديد (tuple/list of 2)
-        if isinstance(cached, (list, tuple)) and len(cached) == 2 and isinstance(cached[0], list):
-            return cached[0], cached[1]
-        if isinstance(cached, list):
-            return cached, [""] * len(cached)
+    # ── Per-item cache: كل منتج بمفتاح مستقل لا يُبطَل بتغيير غيره ────────
+    def _item_ck(it):
+        return hashlib.md5(json.dumps(
+            {"o": it["our"], "c": [c["name"] for c in it["candidates"]]},
+            ensure_ascii=False, sort_keys=True,
+        ).encode()).hexdigest()
 
-    # ── بناء الـ prompt — Chain of Thought ──────────────────────────────
+    item_keys   = [_item_ck(it) for it in batch]
+    cached_vals = [_cget(k) for k in item_keys]
+
+    pending_pos = [i for i, v in enumerate(cached_vals) if v is None]
+
+    # جميع العناصر مُخزَّنة مسبقاً — أعد فوراً بدون استدعاء AI
+    if not pending_pos:
+        out_i = [
+            v[0] if isinstance(v, (list, tuple)) and len(v) >= 1 else -1
+            for v in cached_vals
+        ]
+        out_r = [
+            v[1] if isinstance(v, (list, tuple)) and len(v) >= 2 else ""
+            for v in cached_vals
+        ]
+        return out_i, out_r
+
+    # العناصر الجديدة فقط تُرسَل للـ AI
+    sub_batch = [batch[i] for i in pending_pos]
+    sub_keys  = [item_keys[i] for i in pending_pos]
+
+    def _save_and_merge(sub_i, sub_r):
+        """يحفظ نتائج sub_batch بمفاتيح فردية ثم يدمجها مع المُخزَّنة."""
+        for k, si, sr in zip(sub_keys, sub_i, sub_r):
+            _cset(k, [si, sr])
+        result_i = [
+            v[0] if isinstance(v, (list, tuple)) and len(v) >= 1 else -1
+            for v in cached_vals
+        ]
+        result_r = [
+            v[1] if isinstance(v, (list, tuple)) and len(v) >= 2 else ""
+            for v in cached_vals
+        ]
+        for sub_pos, orig_i in enumerate(pending_pos):
+            result_i[orig_i] = sub_i[sub_pos]
+            result_r[orig_i] = sub_r[sub_pos]
+        return result_i, result_r
+
+    # ── بناء الـ prompt — Chain of Thought (على sub_batch فقط) ──────────
     lines = []
-    for i, it in enumerate(batch):
+    for i, it in enumerate(sub_batch):
         cands = "\n".join(
             f"  {j+1}. {c['name']} | {int(c.get('size',0))}ml | "
             f"{c.get('type','?')} | {c.get('gender','?')} | {c.get('price',0):.0f}ر.س"
@@ -1893,7 +1926,7 @@ def _ai_batch(batch):
         + "\n\n".join(lines)
         + '\n\nأعد كائن JSON فقط (بدون أي نصوص قبله أو بعده):\n'
         + '{"results": [{"index": رقم_المرشح_الصحيح_أو_0_إذا_لا_يوجد, "reason": "سبب قصير"}, ...]}\n'
-        + f'يجب أن يحتوي على {len(batch)} عنصر بالضبط. index=0 يعني لا تطابق.'
+        + f'يجب أن يحتوي على {len(sub_batch)} عنصر بالضبط. index=0 يعني لا تطابق.'
     )
 
     def _parse(txt):
@@ -1915,18 +1948,15 @@ def _ai_batch(batch):
             out_indices: list = []
             out_reasons: list = []
 
-            for j, it in enumerate(batch):
+            for j, it in enumerate(sub_batch):
                 entry = raw[j] if j < len(raw) else None
-                # صيغة جديدة: {"index": N, "reason": "..."}
                 if isinstance(entry, dict):
                     n = entry.get("index", 1)
                     reason = str(entry.get("reason", "")).strip()
                 elif entry is not None:
-                    # صيغة قديمة: رقم مباشر
                     n = entry
                     reason = ""
                 else:
-                    # دفعة مبتورة — لا نفترض تطابقاً وهمياً
                     n = 0
                     reason = "دفعة مبتورة"
                 try:
@@ -1938,17 +1968,17 @@ def _ai_batch(batch):
                 elif n == 0:
                     out_indices.append(-1)
                 else:
-                    out_indices.append(0)
+                    # رقم خارج النطاق (n > عدد المرشحين) → لا تطابق ولا تختر وهمياً
+                    out_indices.append(-1)
                 out_reasons.append(reason)
 
-            if len(out_indices) == len(batch):
+            if len(out_indices) == len(sub_batch):
                 return out_indices, out_reasons
             return None, None
         except Exception:
             return None, None
 
     # ── 1. Gemini ─────────────────────────────────────────────────────────
-    # نزيد maxOutputTokens لاستيعاب الـ reasons في JSON
     g_payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0, "maxOutputTokens": 600, "topP": 1, "topK": 1}
@@ -1962,8 +1992,7 @@ def _ai_batch(batch):
                 txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 out_i, out_r = _parse(txt)
                 if out_i is not None:
-                    _cset(ck, [out_i, out_r])
-                    return out_i, out_r
+                    return _save_and_merge(out_i, out_r)
             elif r.status_code == 429:
                 time.sleep(3)
                 try:
@@ -1972,8 +2001,7 @@ def _ai_batch(batch):
                         txt = r2.json()["candidates"][0]["content"]["parts"][0]["text"]
                         out_i, out_r = _parse(txt)
                         if out_i is not None:
-                            _cset(ck, [out_i, out_r])
-                            return out_i, out_r
+                            return _save_and_merge(out_i, out_r)
                 except Exception:
                     pass
         except Exception:
@@ -1997,8 +2025,7 @@ def _ai_batch(batch):
                     txt = r.json()["choices"][0]["message"]["content"]
                     out_i, out_r = _parse(txt)
                     if out_i is not None:
-                        _cset(ck, [out_i, out_r])
-                        return out_i, out_r
+                        return _save_and_merge(out_i, out_r)
                 elif r.status_code in (404, 400):
                     continue
                 elif r.status_code in (401, 402):
@@ -2008,7 +2035,7 @@ def _ai_batch(batch):
 
     # ── 3. Fuzzy fallback — لا يتوقف أبداً ──────────────────────────────
     out_i, out_r = [], []
-    for it in batch:
+    for it in sub_batch:
         cands = it.get("candidates", [])
         if not cands:
             out_i.append(-1)
@@ -2019,7 +2046,7 @@ def _ai_batch(batch):
         else:
             out_i.append(-1)
             out_r.append(f"أفضل نتيجة fuzzy ({cands[0].get('score',0):.0f}%) أقل من الحد الأدنى")
-    return out_i, out_r
+    return _save_and_merge(out_i, out_r)
 
 
 # ═══════════════════════════════════════════════════════
@@ -2132,8 +2159,9 @@ def _row(product, our_price, our_id, brand, size, ptype, gender,
             score=score,
             مصدر_المطابقة="score_below_60",
         )
-    elif src in ("gemini","auto") or score >= REVIEW_MAX:
-        # مطابقة مؤكدة (≥85%) → توزيع حسب السعر
+    elif (src in ("gemini", "auto") and score >= NO_MATCH_THRESHOLD) or score >= REVIEW_MAX:
+        # H5 Fix: src=gemini/auto يشترط score >= 60 للقبول كمؤكد (يمنع مطابقات ضعيفة تمر بسبب المصدر)
+        # مطابقة مؤكدة (AI-confirmed أو ≥85%) → توزيع حسب السعر
         if our_price > 0 and cp > 0:
             if diff > PRICE_DIFF_THRESHOLD:     dec = "🔴 سعر أعلى"
             elif diff < -PRICE_DIFF_THRESHOLD:   dec = "🟢 سعر أقل"
@@ -2423,7 +2451,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
                     product, best0.get("name", ""), _vmr.get("reason", ""),
                 )
                 audit_stats["no_competitor_found"] += 1
-                audit_stats["processed"] -= 1    # تراجع عن العدّاد السابق
+                audit_stats["processed"] = max(0, audit_stats["processed"] - 1)
                 results.append(
                     _excluded_match_row(
                         product, our_price, our_id, display_brand, size, ptype, gender,
@@ -2457,7 +2485,7 @@ def run_full_analysis(our_df, comp_dfs, progress_callback=None, use_ai=True):
             if not _filtered_top5:
                 # كل المرشحين رُفضوا بالفحص الصارم → مفقود مباشرةً
                 audit_stats["no_competitor_found"] += 1
-                audit_stats["processed"] -= 1
+                audit_stats["processed"] = max(0, audit_stats["processed"] - 1)
                 results.append(
                     _excluded_match_row(
                         product, our_price, our_id, display_brand, size, ptype, gender,
@@ -2741,6 +2769,9 @@ def find_missing_products(our_df, comp_dfs):
                 _conf_level = "yellow"   # مفقود محتمل — يحتاج تحقق
             elif _has_var and variant.get("type") == "similar":
                 _conf_level = "red"      # مشكوك فيه — محظور الإرسال
+            elif score >= 68:
+                # E2 Fix: درجة تشابه عالية (68%+) = منتج مشابه لدينا → لا يُرسَل تلقائياً
+                _conf_level = "yellow"
             else:
                 _conf_level = "green"
 
@@ -2933,8 +2964,11 @@ def _last_chance_ai_batch(pending: list) -> list:
         )
     prompt = (
         "أنت خبير عطور. لكل منتج أدناه، حدد إذا كان موجوداً بالفعل في "
-        "قائمته المرفقة (نفس الماركة ونفس الموديل — بصرف النظر عن "
-        "اختلاف اللغة أو الحجم الطفيف).\n\n"
+        "قائمته المرفقة (نفس الماركة ونفس الموديل ونفس الحجم تماماً).\n\n"
+        "⛔ قواعد صارمة لا استثناء فيها:\n"
+        "• 50ml ≠ 100ml حتى لو نفس العطر — الحجم المختلف يعني منتج مختلف.\n"
+        "• EDT ≠ EDP ≠ Parfum — التركيز المختلف = منتج مختلف.\n"
+        "• إذا لم تجد تطابقاً مثالياً → match=0 (لا تخمّن).\n\n"
         + "\n\n".join(lines)
         + '\n\nأعد JSON فقط بهذه الصيغة (بدون أي نصوص إضافية):\n'
         + '{"results": [{"match": رقم_المنتج_أو_0, "confidence": 0_إلى_100}, ...]}'
@@ -3420,7 +3454,9 @@ def smart_match_product(
                 chosen      = cands[ai_idx[0]]
                 matched_id   = str(chosen.get("product_id") or chosen.get("id") or "")
                 matched_name = chosen.get("name", "")
-                ai_score     = float(chosen.get("score") or best_score)
+                # AI أكّد التطابق → الثقة لا تقل عن 90 حتى لو لم يُخزَّن score في المرشح
+                _cand_score  = float(chosen.get("score") or 0)
+                ai_score     = max(_cand_score if _cand_score > 0 else best_score, 90.0)
                 if _DB_OK:
                     _im2(
                         name_hash, product_name, normalized,

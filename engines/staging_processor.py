@@ -88,7 +88,76 @@ def _read_pending_staging_batch(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  2. استخراج أسعار المنافسين من raw_json
+#  2-A. قراءة سعر منتجنا من our_catalog
+# ══════════════════════════════════════════════════════════════════════════
+def _get_our_price_from_catalog(our_product_id: str, db_path: str = None) -> float:
+    """يقرأ سعرنا الحقيقي من our_catalog بالـ product_id."""
+    if not _DB_OK or not our_product_id or get_db_connection is None:
+        return 0.0
+    try:
+        with get_db_connection(db_path) as conn:
+            row = conn.execute(
+                "SELECT price FROM our_catalog WHERE product_id=?",
+                (str(our_product_id),),
+            ).fetchone()
+        return float(row[0] or 0) if row and row[0] else 0.0
+    except Exception as exc:
+        logger.debug("_get_our_price_from_catalog: %s", exc)
+        return 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  2-B. بناء مرشحين من our_catalog للمنتجات غير المُخزَّنة في Cache
+# ══════════════════════════════════════════════════════════════════════════
+def _build_candidates_from_catalog(
+    product_name: str,
+    db_path: str = None,
+    limit: int = 10,
+) -> list:
+    """
+    يبني قائمة مرشحين من our_catalog بفلترة fuzzy مسبقة.
+    يُستخدَم فقط عند Cache Miss الكامل (لا مرشحين مُمررين).
+    """
+    if not _DB_OK or not product_name or get_db_connection is None:
+        return []
+    try:
+        with get_db_connection(db_path) as conn:
+            rows = conn.execute(
+                "SELECT product_id, product_name, price FROM our_catalog LIMIT 2000"
+            ).fetchall()
+        if not rows:
+            return []
+        try:
+            from rapidfuzz import process as rf_proc, fuzz as rf_fuzz
+            names      = [r[1] for r in rows]
+            hits       = rf_proc.extract(
+                product_name, names, scorer=rf_fuzz.token_set_ratio,
+                limit=limit, score_cutoff=45,
+            )
+            rows_by_name = {r[1]: r for r in rows}
+            return [
+                {
+                    "name":       row[1],
+                    "product_id": row[0],
+                    "price":      float(row[2] or 0),
+                    "score":      score,
+                }
+                for hit_name, score, _ in hits
+                if (row := rows_by_name.get(hit_name))
+            ]
+        except ImportError:
+            # rapidfuzz غير متاح → أعد أول N منتجات كـ fallback
+            return [
+                {"name": r[1], "product_id": r[0], "price": float(r[2] or 0), "score": 50}
+                for r in rows[:limit]
+            ]
+    except Exception as exc:
+        logger.debug("_build_candidates_from_catalog: %s", exc)
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  2-C. استخراج أسعار المنافسين من raw_json
 # ══════════════════════════════════════════════════════════════════════════
 def _extract_competitor_prices(record: Dict[str, Any]) -> List[float]:
     """
@@ -149,16 +218,33 @@ async def _process_staging_record(
         outcome["error"] = "engine غير محمَّل"
         return outcome
 
-    # ── المطابقة — يُشغِّل smart_match_product (Cache-first) ─────────────
+    # ── المطابقة — Cache-First ثم Fuzzy+AI إذا لم يُوجد في Cache ───────────
     try:
         comp_price = float(record.get("price") or 0)
         match_result = await asyncio.to_thread(
             smart_match_product,
             product_name,
-            None,       # candidates: None في سياق Staging (Cache-Only لأول مرة)
+            None,   # Cache-Only أولاً (صفر تكلفة AI)
             comp_price,
             db_path,
         )
+
+        # Bug 2 Fix: Cache Miss بلا مرشحين → ابنِ مرشحين من كتالوجنا وأعد المحاولة
+        if (match_result.get("match_method") == "no_candidates"
+                and not match_result.get("from_cache")):
+            cands = await asyncio.to_thread(
+                _build_candidates_from_catalog, product_name, db_path
+            )
+            if cands:
+                match_result = await asyncio.to_thread(
+                    smart_match_product,
+                    product_name,
+                    cands,
+                    comp_price,
+                    db_path,
+                )
+                outcome["match_method_retry"] = "catalog_candidates"
+
         outcome["matched"]      = not match_result.get("no_match", True)
         outcome["from_cache"]   = match_result.get("from_cache", False)
         outcome["match_method"] = match_result.get("match_method", "unknown")
@@ -173,7 +259,10 @@ async def _process_staging_record(
     if outcome["matched"] and _PRICING_OK and evaluate_and_store_pricing is not None:
         our_prod_id   = match_result.get("our_product_id", "")
         our_prod_name = match_result.get("our_product_name", "")
-        our_price     = float(record.get("price") or 0)
+        # Bug 1 Fix: سعرنا يُقرأ من our_catalog لا من سجل المنافس
+        our_price = await asyncio.to_thread(
+            _get_our_price_from_catalog, our_prod_id, db_path
+        )
         comp_prices   = _extract_competitor_prices(record)
 
         if our_price > 0 and comp_prices:
