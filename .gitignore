@@ -1,47 +1,44 @@
+
+# Environments
+# Logs
+# Project specific
 # Python
-__pycache__/
-*.py[cod]
+# SQLite Databases (Crucial for production)
 *$py.class
+*.db
+*.egg
+*.egg-info/
+*.log
+*.py[cod]
 *.so
+*.sqlite3
 .Python
+.cursor/
+.eggs/
+.env
+.installed.cfg
+.streamlit/
+.venv
+.verdent/
+ENV/
+MANIFEST
+__pycache__/
 build/
+data/
 develop-eggs/
 dist/
 downloads/
 eggs/
-.eggs/
+env.bak/
+env/
 lib/
 lib64/
 parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# SQLite Databases (Crucial for production)
-*.db
-*.sqlite3
-raw_scrape_staging.db
-
-# Logs
-*.log
-
-# Project specific
-.cursor/
-.streamlit/
-.verdent/
-data/
 pscache/
+raw_scrape_staging.db
+sdist/
+share/python-wheels/
+var/
+venv.bak/
+venv/
+wheels/
