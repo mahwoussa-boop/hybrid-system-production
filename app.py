@@ -1149,13 +1149,19 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
 
         # بطاقة VS مع رقم المنتج + صور (lazy) عند توفرها — وضع مضغوط لقسم «سعر أعلى»
         _vs_compact = bool(compact_cards and prefix == "raise")
+        # توليد HTML المنافسين مسبقاً لتمريره داخل البطاقة
+        _all_comps_pre = row.get("جميع_المنافسين", row.get("جميع المنافسين", []))
+        _all_comps_pre = filter_unique_competitors(_all_comps_pre)
+        _extra_comps_html = comp_strip(_all_comps_pre) if len(_all_comps_pre) > 0 else ""
+
         _vs_html = vs_card(our_name, our_price, comp_name,
                            comp_price, diff, comp_src, _pid_str,
                            our_img=_our_img_v, comp_img=_comp_img_v,
                            comp_url=_comp_url_v, our_url=_our_url_v,
                            accent_border=_vs_border, row_bg=_vs_row_bg,
                            price_alert=_price_alert,
-                           compact=_vs_compact)
+                           compact=_vs_compact,
+                           extra_comps_html=_extra_comps_html)
         st.markdown(_vs_html, unsafe_allow_html=True)
 
         # شريط المعلومات
@@ -1201,12 +1207,6 @@ def render_pro_table(df, prefix, section_type="update", show_search=True,
                     f'{_ai_reason}</div>',
                     unsafe_allow_html=True,
                 )
-
-        # شريط المنافسين المصغر — منقّى (1 منافس = أفضل مطابقة واحدة فقط)
-        all_comps = row.get("جميع_المنافسين", row.get("جميع المنافسين", []))
-        all_comps = filter_unique_competitors(all_comps)
-        if len(all_comps) > 0:
-            st.markdown(comp_strip(all_comps), unsafe_allow_html=True)
 
         # ── شريط الإجراءات التفاعلي (Event-Driven via on_click) ─────────
         if prefix in ("raise", "lower"):
@@ -2535,7 +2535,8 @@ elif page == "🔍 منتجات مفقودة":
                     is_tester_flag  = bool(row.get("هو_تستر", False))
                     conf_level      = str(row.get("مستوى_الثقة", "green"))
                     conf_score      = safe_float(row.get("درجة_التشابه", 0))
-                    suggested_price = round(price - 1, 2) if price > 0 else 0
+                    # F1 Fix: هامش ربح 5% فوق سعر المنافس (متوافق مع SALLA_PRICE_MARKUP)
+                    suggested_price = round(price * 1.05) if price > 0 else 0
                     _gz_status      = str(row.get("حالة_المنتج", "")).strip()
                     _gz_similar     = str(row.get("منتج_مشابه_لدينا", "")).strip()
 
@@ -2743,7 +2744,9 @@ elif page == "🔍 منتجات مفقودة":
                     f'✅ {_n_sel} منتج محدد — اختر إجراء:</span></div>',
                     unsafe_allow_html=True,
                 )
-                _sel_df = filtered.iloc[sorted(st.session_state.miss_sel)].copy()
+                # حماية معمارية: تصفية الفهارس التي قد تخرج عن نطاق الجدول بعد الفلترة
+                valid_indices = [i for i in st.session_state.miss_sel if i < len(filtered)]
+                _sel_df = filtered.iloc[sorted(valid_indices)].copy()
                 st.info(
                     "⚠️ ملف **سلة الشامل** سيحتوي على أوصاف نصية placeholder — "
                     "استخدم زر **توليد وصف AI** لكل منتج أولاً قبل التصدير للحصول على أوصاف احترافية.",
@@ -2859,11 +2862,12 @@ elif page == "🔍 منتجات مفقودة":
                                 key="ai_nb_full",
                                 use_container_width=True,
                             )
-                    _sg = format_missing_for_salla(_gen_df)
-                    if not _sg.empty:
+                    # Bug 1 Fix: export_to_salla_shamel تبني صف «بيانات المنتج» وترويسة سلة الصحيحة
+                    _sg_bytes = export_to_salla_shamel(_gen_df, generate_descriptions=False)
+                    if _sg_bytes and len(_sg_bytes) > 10:
                         st.download_button(
                             "📥 ملف سلة الكامل (مع وصف AI)",
-                            data=_sg.to_csv(index=False).encode("utf-8-sig"),
+                            data=_sg_bytes,
                             file_name="salla_ai_descriptions.csv",
                             mime="text/csv",
                             type="primary",
@@ -2938,6 +2942,34 @@ elif page == "⚪ مستبعد (لا يوجد تطابق)":
         df = st.session_state.results["excluded"]
         if df is not None and not df.empty:
             st.info(f"⚪ {len(df)} منتج مستبعد — يمكن مراجعة الأسباب في عمود القرار والمصدر")
+
+            # E6 Fix: عرض تفصيل أسباب الاستبعاد
+            _src_col = next(
+                (c for c in ("مصدر_المطابقة", "مصدر المطابقة", "source") if c in df.columns),
+                None,
+            )
+            if _src_col:
+                _reason_map = {
+                    "no_candidates":           "🔍 لا يوجد مرشح في الفهارس",
+                    "below_match_threshold":   "📉 درجة تشابه أقل من 60%",
+                    "hard_reject_conc_size":   "⚗️ رُفض: حجم/تركيز مختلف",
+                    "hard_reject_all_candidates": "❌ كل المرشحين رُفضوا",
+                    "score_below_60":          "📉 مطابقة ضعيفة (< 60%)",
+                }
+                _counts = df[_src_col].astype(str).str.split(":").str[0].value_counts()
+                with st.expander(f"📊 تفصيل أسباب الاستبعاد ({len(_counts)} سبب)", expanded=False):
+                    _reason_rows = []
+                    for _reason, _cnt in _counts.items():
+                        _label = _reason_map.get(_reason, _reason)
+                        _reason_rows.append({"السبب": _label, "العدد": int(_cnt)})
+                    if _reason_rows:
+                        import pandas as _pd_e6
+                        st.dataframe(
+                            _pd_e6.DataFrame(_reason_rows),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
             render_pro_table(df, "excluded", "excluded")
         else:
             st.success("✅ لا توجد منتجات مستبعدة — كل المنتجات لها مسار مطابقة أو مراجعة")

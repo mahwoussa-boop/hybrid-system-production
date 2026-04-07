@@ -250,11 +250,13 @@ def stat_card(icon, label, value, color="#6C63FF"):
 
 def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", product_id="",
             our_img="", comp_img="", comp_url="", our_url="",
-            accent_border=None, row_bg=None, compact=False, price_alert=""):
+            accent_border=None, row_bg=None, compact=False, price_alert="",
+            extra_comps_html=""):
     """بطاقة VS الأساسية — المنافس الرئيسي (الأقل سعراً). our_img/comp_img/comp_url/our_url اختياريان.
     accent_border/row_bg: تنسيق اختياري لصفوف «مستبعد» (رمادي).
     compact: وضع أصغر لقسم «سعر أعلى» (فرصة خفض).
-    price_alert: تنبيه تغيير سعر المنافس من الرادار التسعيري."""
+    price_alert: تنبيه تغيير سعر المنافس من الرادار التسعيري.
+    extra_comps_html: HTML شريط المنافسين المجمّع — يُعرض داخل البطاقة لتحسين التجميع البصري."""
     dc = "#FF1744" if diff > 0 else "#00C853" if diff < 0 else "#FFD600"
     src = f'<div style="font-size:.65rem;color:#666">{comp_source}</div>' if comp_source else ""
     pid = str(product_id) if product_id and str(product_id) not in ("", "nan", "None", "0") else ""
@@ -285,7 +287,7 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
     if suggested > 0 and diff > 10:
         sugg_html = f'<div style="font-size:.7rem;color:#4caf50;margin-top:2px">مقترح: {suggested:,.0f} ر.س</div>'
     our_title_html = _linked_product_title(
-        our_name, our_url, color="#B8B4FF", font_size=_fs_our,
+        our_name, our_url, color="#4fc3f7", font_size=_fs_our,
     )
     our_block = (
         f'<div class="our-s" style="display:flex;align-items:flex-start;gap:10px;flex-direction:row-reverse">'
@@ -295,7 +297,7 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
         f'<div style="font-size:{_fs_price};font-weight:900;color:#6C63FF;margin-top:2px">{our_price:.0f} ر.س</div>{sugg_html}</div></div>'
     )
     comp_title_html = _linked_product_title(
-        comp_name, comp_url, color="#FFD180", font_size=_fs_our,
+        comp_name, comp_url, color="#ff9800", font_size=_fs_our,
     )
     # data-img: رابط صورة المنافس — للتشخيص عبر DOM بدون إظهار نص
     _comp_img_attr = f' data-img="{html.escape(str(comp_img or ""), quote=True)}"' if comp_img else ' data-img=""'
@@ -322,11 +324,15 @@ def vs_card(our_name, our_price, comp_name, comp_price, diff, comp_source="", pr
             f'font-size:.78rem;font-weight:700;color:{"#00C853" if _is_drop else "#FF5252"};'
             f'text-align:center;letter-spacing:.3px">🚨 رادار التسعير: {html.escape(_pa)}</div>'
         )
+    _extra_block = (
+        f'<div style="margin-top:8px;border-top:1px solid rgba(255,255,255,.05);'
+        f'padding-top:6px">{extra_comps_html}</div>'
+    ) if extra_comps_html else ""
     inner = f'''<div class="{_vs_cls}">
 {our_block}
 <div class="vs-badge">VS</div>
 {comp_block}
-</div><div style="text-align:center;background:#1A1A2E;padding:3px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:{_diff_fs}">الفرق: {diff:+.0f} ر.س</span></div>{_alert_html}{_foot}'''
+</div><div style="text-align:center;background:#1A1A2E;padding:3px;border-left:1px solid #333344;border-right:1px solid #333344;margin:0"><span style="color:{dc};font-weight:700;font-size:{_diff_fs}">الفرق: {diff:+.0f} ر.س</span></div>{_alert_html}{_foot}{_extra_block}'''
     if accent_border:
         bg = row_bg if row_bg is not None else "rgba(158,158,158,.10)"
         return (
@@ -460,7 +466,7 @@ def miss_card(name, price, brand, size, ptype, comp, suggested_price,
         f"{dup_compare_html}"
         f"</div>"
         f'<div class="miss-prices">'
-        f'<div class="miss-comp-price">{price:,.0f} ر.س</div>'
-        f'<div class="miss-suggested">مقترح: {suggested_price:,.0f} ر.س</div>'
+        f'<div class="miss-comp-price">{"غير محدد" if price <= 0 else f"{price:,.0f} ر.س"}</div>'
+        f'<div class="miss-suggested">{"" if suggested_price <= 0 else f"مقترح: {suggested_price:,.0f} ر.س"}</div>'
         f"</div></div>{_foot}</div>"
     )
